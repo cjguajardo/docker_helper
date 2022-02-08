@@ -1,0 +1,440 @@
+#!/bin/bash
+
+ENVIRONMENT=""
+BASH=0
+PORT=80
+NGROK_URL="http://localhost:$PORT"
+ADB=0
+RUN=""
+OBFUSCATE=0
+APP_NAME="my-super-app"
+APP_NAME_UPPER="MySuperApp"
+AWS_REGION="eu-west-1"
+AWS_ID="xxxxxxxxxxxxxx"
+REPOSITORY="${AWS_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+#fill LINE variable with ascii char 205
+LINE=$(printf "%*s" $(tput cols) | tr ' ' =)
+
+log() {
+    color=7
+    
+    TEXT=$2
+    centered=$3
+    bold=0
+    if [ "$4" == 1 ]; then
+        bold=1
+    fi
+
+    case $1 in
+        "red") color="\033[${bold};31m";;
+        "green") color="\033[${bold};32m";;
+        "yellow") color="\033[${bold};33m";;
+        "blue") color="\033[${bold};34m";;
+        "gray") color="\033[${bold};37m";;
+        "brown") color="\033[${bold};33m";;
+        "purple") color="\033[${bold};35m";;
+        "cyan") color="\033[${bold};36m";;
+        "white") color="\033[${bold};37m";;
+    esac
+    
+    if [[ "$centered" == 1 ]]; then
+      printf "${color}%*s\033[0m\n" $(((${#TEXT}+$(tput cols))/2)) "$TEXT"
+    else
+      echo -e "${color}$TEXT\033[0m"
+    fi
+}
+kill() {
+  log "red" "KILLING $1"
+  # Detener contenedor y eliminar imagen
+  containerId=$(docker container list | grep $1 | awk "{print $1}")
+  dockerImage=$(docker container list | grep $1 | awk "{print $2}")
+  # split dockerImage and assign the last part to a variable
+  imageTag=$(echo $dockerImage | awk -F: "{print $NF}")
+  log "red" "IMAGE TAG TO REMOVE $imageTag"
+  imageId=$(docker image ls | grep $1 | grep -iF -v "$imageTag" | awk "{print $3}")
+  log "red" "IMAGE ID TO REMOVE $imageId"
+
+  if [[ -n $containerId ]]; then
+    log "red" "KILLING $containerId"
+    docker stop $containerId
+    #if imageId is not empty, remove image
+    if [[ -n $imageId ]]; then
+      log "red" "REMOVING $imageId"
+      docker rmi $imageId
+    fi
+  fi
+}
+sendNotification() {
+    N_TITLE="${APP_NAME} - ${ENVIRONMENT} BUILDER"
+    N_MESSAGE="$1"
+
+    if [ "$(uname)" == "Darwin" ]; then
+        ICN_RESOURCE="$PWD/src/public/redmin.icns"
+        DATA="\"$N_MESSAGE\" with title \"$N_TITLE\" sound name \"Glass\""
+        osascript -e "display notification $DATA"
+    elif [ "$(uname)" == "Linux" ]; then
+        echo "Checking if libnotify is installed"
+        if dpkg -l libnotify > /dev/null; then
+            echo "libnotify is installed"
+        else
+            echo "libnotify is not installed"
+            echo "Installing libnotify"
+            sudo apt-get install libnotify
+        fi
+        notify-send -u normal -a "TEST" -i dialog-information "Hello World" "This is a test"
+    fi
+}
+openBash() {
+  if [[ $BASH = 1 ]]; then
+    log "green" "RUNNING BASH"
+    docker exec -it $1 /bin/bash
+  fi
+}
+goDev() {
+  getLatestVersion "app"
+  log "blue" "DEVELOPMENT"
+  kill "${APP_NAME}_dev"
+  kill "${APP_NAME}"
+  log "blue" "CREATING DEVELOPMENT DOCKER IMAGE"
+  docker build -t ${APP_NAME}_dev:$newVersion -f Dockerfile.dev .
+  log "blue" "RUNNING DEVELOPMENT CONTAINER"
+  docker run -d -p $PORT:80 --rm \
+    -v $PWD/src:/var/www/html \
+    --env-file=config/env_params \
+    -e APP_URL=$NGROK_URL \
+    -e APP_NAME="${APP_NAME_UPPER}:DEV" \
+    -e APP_VERSION="$newVersion" \
+    --network=dockerdb_default \
+    --name ${APP_NAME}_dev \
+    ${APP_NAME}_dev:$newVersion
+  
+  openBash "${APP_NAME}_dev"
+
+  launchAdb
+}
+goProd() {
+  getLatestVersion "app"
+  log "green" "PRODUCTION"
+  obfuscate
+  kill "${APP_NAME}"
+  kill "${APP_NAME}_dev"
+  log "green" "CREATING PRODUCTION DOCKER IMAGE"
+  docker build -t ${APP_NAME}:$newVersion -f Dockerfile .
+  deobfuscate
+  log "green" "RUNNING PRODUCTION CONTAINER"
+  docker run -d -p $PORT:80 --rm \
+    --env-file=config/env_params \
+    -e DB_CONNECTION="mysql" \
+    -e DB_PORT="3306" \
+    -e DB_DATABASE="redmin_db" \
+    -e APP_NAME="${APP_NAME_UPPER}:PROD" \
+    -e APP_URL="http://localhost" \
+    -e APP_VERSION="$newVersion" \
+    --name ${APP_NAME} \
+    ${APP_NAME}:$newVersion
+
+  openBash "${APP_NAME}"
+}
+getLatestVersion() {
+    # if $1 is equals "app" then call getLatesVersion with "v" as parameter
+  if [[ $1 == "app" ]]; then
+    param="v"
+  else
+    newVersion=$1
+    return "$newVersion"
+  fi
+  # Get the last version from ecr
+  currentVersion=$(aws ecr describe-images --repository-name ${APP_NAME} --query "sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]")
+  # remove quotes
+  currentVersion=${currentVersion//\"/}
+  # Print the current version
+  log "blue" "CURRENT VERSION: $currentVersion"
+  # if currentVersion starts with app then remove it
+  if [[ $currentVersion == *"app"* ]]; then
+    currentVersion=${currentVersion#*app}
+  fi
+  # Remove $param word from the string
+  currentVersion=${currentVersion//$param/}
+  # Split the string to get the version parts
+  IFS="." read -r -a array <<< "$currentVersion"
+
+  # assign the first item to major variable
+  major=${array[0]}
+  # assign the second item to minor variable
+  minor=${array[1]}
+  # assign the third item to patch variable
+  patch=${array[2]}
+
+  # increment the patch version
+  patch=$((patch+1))
+
+  # if the patch version is greater than 99, increment the minor version
+  if [[ $patch -gt 99 ]]; then
+    minor=$((minor+1))
+    patch=0
+  fi
+
+  # if the minor version is greater than 99, increment the major version
+  if [[ $minor -gt 99 ]]; then
+    major=$((major+1))
+    minor=0
+  fi
+
+  # if major is empty or null assign 0
+  if [[ -z $major ]]; then
+    major=1
+    patch=0
+  fi
+  # if major is "null" assign 0
+  if [[ $major == "null" ]]; then
+    major=1
+    patch=0
+  fi
+
+  # if minor is empty assign 0
+  if [[ -z $minor ]]; then
+    minor=0
+  fi
+
+  version="$major.$minor.$patch"
+
+  # append the last part
+  newVersion="v$version"
+
+  # Print the new version
+  log "blue" "NEW VERSION: $newVersion"
+
+  #return the new version value
+  echo "$newVersion"
+}
+awsLogin() {
+  log "green" "AWS LOGIN"
+  aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REPOSITORY}
+}
+pushToAWS() {
+  awsLogin
+  getLatestVersion "app"
+
+  log "yellow" "Please, select an option:"
+  log "yellow" "1. ${APP_NAME}:$newVersion"
+  log "yellow" "2. ${APP_NAME}:latest"
+  log "yellow" "3. Custom"
+
+  read -p "Your option: " option
+
+  if [[ $option == 1 ]]; then
+    tag="$newVersion"
+  elif [[ $option == 2 ]]; then
+    tag="latest"
+  elif [[ $option == 3 ]]; then
+    read -p "Type your custom tag: " tag
+  else
+    log "red" "Invalid option"
+    exit 1
+  fi
+
+  log "green" "TAG: $tag"
+  log "yellow" "PUSH TO AWS ${APP_NAME}:$tag"
+  
+  #obfuscate
+
+  # docker build -t ${APP_NAME}:"$tag" -t ${APP_NAME}:latest .
+  sendNotification "IMAGE Build" "Image ${APP_NAME}:$tag builded"
+  #deobfuscate
+
+  docker tag ${APP_NAME}:"$tag" ${REPOSITORY}/${APP_NAME}:"$tag"
+  docker tag ${APP_NAME}:latest ${REPOSITORY}/${APP_NAME}:latest
+  docker push ${REPOSITORY}/${APP_NAME}:"$tag"
+  sendNotification "IMAGE Pushed" "Image ${APP_NAME}:$tag pushed"
+}
+goOther() {
+  if [[ $OBFUSCATE == 1 ]]; then
+    obfuscate
+  elif [[ $OBFUSCATE == 2 ]]; then
+    deobfuscate
+  else
+    goHelp
+  fi
+}
+launchAdb() {
+  if [[ $NGROK_URL != "http://localhost:$PORT" ]]; then
+    log "yellow" "OPENNING PWA ($NGROK_URL) ON DEVICE"
+    adb shell am start -n com.android.chrome/com.google.android.apps.chrome.Main -d "$NGROK_URL"
+  else
+    log "red" "YOU MUST ADD AN URL AS A PARAMETER -url=<URL{:PORT}>."
+    log "red" "USE -u=https://... OR -url=https://..."
+  fi
+}
+pullAndRun() {
+  log "blue" "PULLING $1"
+  awsLogin
+  # if $1 is empty then pull the latest image
+  if [[ -z $1 ]]; then
+    getLatestVersion "app"
+    IMAGE_TO_PULL=${REPOSITORY}/${APP_NAME}:$currentVersion
+  else
+    IMAGE_TO_PULL=${REPOSITORY}/${APP_NAME}:latest
+  fi
+  kill "${APP_NAME}"
+  kill "${APP_NAME}_dev"
+  docker run -d -p $PORT:80 --rm \
+    --env-file=config/.env \
+    -e APP_URL=$NGROK_URL \
+    --network=dockerdb_default \
+    --name ${APP_NAME}_dev $IMAGE_TO_PULL
+
+  openBash "${APP_NAME}_dev"
+}
+goHelp() {
+  clear
+  log "yellow" $LINE
+  log "white" " SCRIPT HELP" 1 1
+  log "yellow" $LINE
+  log "yellow" "  bash start <COMMAND> <OPTIONS>"
+  log "yellow" "  bash start [--dev | --prod | --aws | -run=<container> | --obfuscate | --deobfuscate] [--bash | --adb | -port]"
+  echo " "
+  log "yellow" "  bash start --aws  Build a production ready docker image and push it to AWS ECR with specified tag."
+  log "yellow" "  bash start -run=<container:tag>  Run a docker container with the specified tag."
+  echo " "
+  log "cyan" "  * By default PORT is 80 and URL is http://localhost for development and production environments."
+  echo " "
+  log "yellow" $LINE
+  log "yellow" "COMANDS" 0 1
+  log "yellow" $LINE
+  echo "  -e=<environment>    : Environment (dev|prod|aws)"
+  echo "  --dev               : Development environment (localhost:80)"
+  echo "  --prod              : Production environment"
+  echo "  --aws               : Publish a production image to AWS repository"
+  echo " "
+  echo "  -r=<container:tag>  : Run a container"
+  echo "  -run=<container:tag>"
+  echo "  --obfuscate         : Obfuscate the code"
+  echo "  --deobfuscate       : Deobfuscate the code"
+  echo " "
+  log "yellow" $LINE
+  log "yellow" "OPTIONS" 0 1
+  log "yellow" $LINE
+  echo "  -u=<url>            : URL to open on device, emulator or browser. Must use with ngrok."
+  echo "  -p=<port>           : Port to run the server"
+  echo "  --adb               : Launch ADB on connected device or emulator with the given url"
+  echo "  -b | --bash         : Launch bash on container"
+  echo "  -h | --help         : Show this help"
+  log "yellow" $LINE
+  echo " "
+  echo " "
+  echo " "
+  log "purple" "Script by: @cjguajardo" 1
+}
+obfuscate() {
+  log "red" "OBFUSCATE"
+  chmod +x scripts/obfuscate.sh
+  /bin/bash scripts/obfuscate.sh
+}
+deobfuscate() {
+  log "blue" "DE-OBFUSCATE"
+  chmod +x scripts/deobfuscate.sh
+  /bin/bash scripts/deobfuscate.sh
+}
+
+for i in "$@"; do
+  case $i in
+    -e=*)
+      ENVIRONMENT="${i#*=}"
+      shift # past argument=value
+      ;;
+    --dev)
+      ENVIRONMENT="dev"
+      shift # past argument=value
+      ;;
+    --prod)
+      ENVIRONMENT="prod"
+      shift # past argument=value
+      ;;
+    --aws)
+      ENVIRONMENT="aws"
+      shift # past argument=value
+      ;;
+    -b|--bash)
+      BASH=1
+      shift # past argument=value
+      ;;
+    -u=*)
+      NGROK_URL="${i#*=}"
+      shift # past argument=value
+      ;;
+    -p=*)
+      PORT="${i#*=}"
+      shift # past argument=value
+      ;;
+    -r=*|-run=*)
+      RUN="${i#*=}"
+      ENVIRONMENT="run"
+      shift # past argument=value
+      ;;
+    -h|--help)
+      ENVIRONMENT="help"
+      goHelp
+      shift
+      ;;
+    --adb)
+      ADB=1
+      ENVIRONMENT="NO_ENV"
+      shift
+      ;;
+    --obfuscate)
+      OBFUSCATE=1
+      ENVIRONMENT="NO_ENV"
+      shift
+      ;;
+    --deobfuscate)
+      OBFUSCATE=2
+      ENVIRONMENT="NO_ENV"
+      shift
+      ;;
+    *)
+      ENVIRONMENT="help"
+      shift
+      ;;
+  esac
+done
+
+RUN_BASH=false
+RUN_ADB=false
+if [[ $BASH == 1 ]]; then
+  RUN_BASH=true
+fi
+if [[ $ADB == 1 ]]; then
+  RUN_ADB=true
+fi
+OBFUSCATION="NONE"
+case $OBFUSCATE in
+  1)
+    OBFUSCATION="OBFUSCATE";;
+  2)
+    OBFUSCATION="DE-OBFUSCATE";;
+  0)
+    OBFUSCATION="NONE";;
+esac
+echo "ENVIRONMENT   = ${ENVIRONMENT}"
+echo "RUN BASH      = ${RUN_BASH}"
+echo "NGROK_URL     = ${NGROK_URL}"
+echo "LAUNCH ADB    = ${RUN_ADB}"
+echo "RUN CONTAINER = ${RUN}"
+echo "OBFUSCATION   = ${OBFUSCATION}"
+echo "APP_NAME      = ${APP_NAME}"
+
+case $ENVIRONMENT in
+  dev)
+    goDev;;
+  prod)
+    goProd;;
+  aws)
+    pushToAWS;;
+  run)
+    pullAndRun "$RUN";;
+  help)
+    goHelp;;
+  *)
+    goOther;;
+esac
